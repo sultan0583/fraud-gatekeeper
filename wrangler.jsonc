@@ -7,19 +7,18 @@
 	"name": "fraud-gatekeeper",
 	"main": "src/index.js",
 	"compatibility_date": "2026-03-01",
+	"account_id": "e1dedbaa7b8736acbd9024dd709bf908",
 	"migrations": [
 		{
-			"new_sqlite_classes": [
-				"MyDurableObject"
-			],
-			"tag": "v1"
+			"tag": "v1",
+			"new_classes": ["FraudTracker"]
 		}
 	],
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "MyDurableObject",
-				"name": "MY_DURABLE_OBJECT"
+				"name": "FRAUD_TRACKER",
+				"class_name": "FraudTracker"
 			}
 		]
 	},
@@ -28,7 +27,18 @@
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
-	]
+	],
+	"routes": [
+		{
+			"pattern": "asultan.xyz/api/auth/signup",
+			"zone_name": "asultan.xyz"
+		},
+		{
+			"pattern": "asultan.xyz/admin/*",
+			"zone_name": "asultan.xyz"
+   		},
+	],
+	
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

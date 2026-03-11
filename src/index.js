@@ -1,68 +1,167 @@
-import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+export class FraudTracker {
+  constructor(state, env) {
+    this.state = state;
+  }
 
-/**
- * Env provides a mechanism to reference bindings declared in wrangler.jsonc within JavaScript
- *
- * @typedef {Object} Env
- * @property {DurableObjectNamespace} MY_DURABLE_OBJECT - The Durable Object namespace binding
- */
+  async fetch(request) {
+    const url = new URL(request.url);
+    const storage = this.state.storage;
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param {DurableObjectState} ctx - The interface for interacting with Durable Object state
-	 * @param {Env} env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx, env) {
-		super(ctx, env);
-	}
+    // --- ADMIN COMMANDS ---
+    if (url.pathname === "/admin/ban") {
+      await storage.put("permanentlyBanned", true);
+      return new Response("ID has been BANNED");
+    }
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param {string} name - The name provided to a Durable Object instance from a Worker
-	 * @returns {Promise<string>} The greeting to be sent back to the Worker
-	 */
-	async sayHello(name) {
-		return `Hello, ${name}!`;
-	}
+    if (url.pathname === "/admin/unban") {
+      await storage.delete("permanentlyBanned");
+      await storage.put("count", 0); // Reset their rate limit too
+      return new Response("ID has been UNBANNED");
+    }
+
+	// NEW: Inspect the DO contents
+    if (url.pathname === "/admin/inspect") {
+      const allData = await storage.list();
+      const alarm = await storage.getAlarm();
+      
+      // Convert Map to a standard Object for JSON response
+      return new Response(JSON.stringify({
+        id: this.state.id.toString(),
+        data: Object.fromEntries(allData),
+        alarmScheduled: alarm ? new Date(alarm).toISOString() : "None",
+        msUntilAlarm: alarm ? alarm - Date.now() : null
+      }, null, 2), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // --- NORMAL CHECKING LOGIC ---
+    const isManualBan = await storage.get("permanentlyBanned") || false;
+    let count = (await storage.get("count")) || 0;
+
+    // Increment request count
+    count++;
+    await storage.put("count", count);
+	console.log(`[DO] ID: ${this.state.id.toString()} | Current Count: ${count}`);
+
+    // Auto-reset rate-limit count every 1 hour (but keep manual bans)
+    const alarm = await storage.getAlarm();
+    if (!alarm) {
+      await storage.setAlarm(Date.now() + 3600000); 
+    }
+
+    return new Response(JSON.stringify({
+      isBanned: isManualBan || count > 5, // Ban if manual OR > 5 hits/hr
+      count: count,
+	  isManualBan: isManualBan
+    }));
+  }
+
+  // Resets the temporary counter every hour
+  async alarm() {
+    const isManualBan = await this.state.storage.get("permanentlyBanned");
+    await this.state.storage.deleteAll();
+    if (isManualBan) await this.state.storage.put("permanentlyBanned", true);
+  }
 }
 
+/**
+ * THE  (Main Worker)
+ */
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param {Request} request - The request submitted to the Worker from the client
-	 * @param {Env} env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param {ExecutionContext} ctx - The execution context of the Worker
-	 * @returns {Promise<Response>} The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx) {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+	// We must clone immediately to keep the body available
+    const originalBody = await request.clone().arrayBuffer();
 
-		return new Response(greeting);
-	},
+    // 1. ADMIN ROUTES
+    if (url.pathname.startsWith("/admin/")) {
+      const secret = url.searchParams.get("key");
+      const targetId = url.searchParams.get("id");
+
+      if (secret !== env.ADMIN_SECRET) return new Response("Wrong Secret Key", { status: 401 });
+      if (!targetId) return new Response("Missing 'id' parameter", { status: 400 });
+
+      const doId = env.FRAUD_TRACKER.idFromName(targetId);
+      const stub = env.FRAUD_TRACKER.get(doId);
+      return stub.fetch(request);
+    }
+
+    // 2. PROTECTION LOGIC (Adjusted for JSON)
+    if (request.method === "POST") {
+      try {
+
+		// We use a separate clone for Turnstile/DO logic
+        const bodyForLogic = JSON.parse(new TextDecoder().decode(originalBody));
+        const token = bodyForLogic.turnstileToken;
+
+		const cf_connecting_ip = request.headers.get("cf-connecting-ip");
+
+        if (!token) {
+          return new Response("Missing Turnstile Token", { status: 400 });
+        }
+
+        // Verify with Cloudflare
+        const verifyResp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `secret=${env.TURNSTILE_SECRET_KEY}&response=${encodeURIComponent(token)}&remoteip=${cf_connecting_ip}&remoteip_leniency="relaxed"`
+        });
+
+
+
+        const outcome = await verifyResp.json();
+		console.log("Turnstile verification outcome:", outcome);
+
+		if (!outcome.success) {
+			return new Response(JSON.stringify({ error: "Turnstile verification failed" }), { 
+					status: 403,
+					headers: { "Content-Type": "application/json" }
+				});
+		}
+
+		const ephId = outcome.metadata?.ephemeral_id;	
+
+        if (ephId) {
+          // Ask the Durable Object for this specific ID
+          const doId = env.FRAUD_TRACKER.idFromName(ephId);
+          const stub = env.FRAUD_TRACKER.get(doId);
+          
+          // We pass the request to the DO to let it increment counts
+          const securityResponse = await stub.fetch(request);
+          const securityCheck = await securityResponse.json();
+
+          console.log("DO says:", securityCheck); // Verify this in 'wrangler tail'
+
+
+          if (securityCheck.isBanned) {
+			if (securityCheck.isManualBan) {
+				return new Response(JSON.stringify({ error: "Manual Ban" }), { 
+					status: 403,
+					headers: { "Content-Type": "application/json" }
+				});
+			} else {
+				return new Response(JSON.stringify({ error: "TOO MUCH!! Unauthorized Device" }), { 
+					status: 403,
+					headers: { "Content-Type": "application/json" }
+				});
+			}
+          }
+        }
+		
+      } catch (e) {
+        // If JSON parsing fails, decide if you want to block or pass
+        return new Response("Invalid JSON Payload", { status: 400 });
+      }
+    }
+
+    // 3. PASS-THROUGH: Forward original request to your backend
+    return fetch(new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: originalBody 
+    }));
+  }
 };
